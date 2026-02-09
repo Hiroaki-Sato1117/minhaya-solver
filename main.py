@@ -1,281 +1,254 @@
 #!/usr/bin/env python3
-"""
-みんはや早押しクイズ回答支援ツール
-- 起動時にマウスで問題領域を選択
-- Apple Vision Frameworkで高速OCR
-- 非同期処理でリアルタイム回答
-- 問題途中でも推測回答
-"""
+"""みんはやソルバー v2.0 — CustomTkinter GUI (Gemini Vision)"""
 
-import cv2
-import anthropic
-import time
 import os
-import threading
-import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+import sys
+import time
+
+import customtkinter as ctk
 from dotenv import load_dotenv
-import Vision
-import Quartz
-from Foundation import NSData
 
-load_dotenv()
+# .env をロード
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
-CAMERA_INDEX = 0
+from config import ConfigStore
+from constants import MINHAYA_GREEN, MINHAYA_TEXT_DIM, MINHAYA_ORANGE
+from core.screen_capture import grab_region, cleanup as cleanup_capture
+from core.image_diff import images_similar
+from core.ai_engine import GeminiVisionEngine, AsyncAIRunner, AIResult
+from ui.capture_window import CaptureWindow
+from ui.answer_window import AnswerWindow
+from ui.settings_dialog import SettingsDialog
 
-class MinhayaSolver:
+
+class MinhayaSolverApp:
+    """メインオーケストレーター
+
+    - after() でキャプチャループを駆動（tkinter メインスレッド）
+    - AI 推論のみバックグラウンドスレッド
+    """
+
     def __init__(self):
-        self.client = anthropic.Anthropic()
-        self.current_answer = "領域を選択してください..."
-        self.current_question = ""
-        self.last_sent_question = ""
-        self.roi = None  # 選択領域 (x, y, w, h)
-        self.selecting = False
-        self.selection_start = None
-        self.selection_end = None
-        self.font = self._load_font()
-        self.processing = False
-        self.lock = threading.Lock()
+        self._config = ConfigStore()
 
-    def _load_font(self):
-        """日本語フォントを読み込み"""
-        font_paths = [
-            "/System/Library/Fonts/ヒラギノ角ゴシック W6.ttc",
-            "/System/Library/Fonts/Hiragino Sans GB.ttc",
-            "/Library/Fonts/Arial Unicode.ttf",
-        ]
-        for path in font_paths:
-            if os.path.exists(path):
-                try:
-                    return ImageFont.truetype(path, 36)
-                except:
-                    continue
-        return ImageFont.load_default()
+        # --- CustomTkinter 設定 ---
+        ctk.set_appearance_mode("dark")
+        ctk.set_default_color_theme("blue")
 
-    def put_japanese_text(self, frame, text, position, color=(0, 255, 0), font_size=36):
-        """OpenCVフレームに日本語テキストを描画"""
-        pil_image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        draw = ImageDraw.Draw(pil_image)
+        # 非表示のルートウィンドウ
+        self._root = ctk.CTk()
+        self._root.withdraw()
+
+        # --- AI エンジン (Gemini Vision のみ) ---
+        api_key = os.getenv("GEMINI_API_KEY", "")
+        if not api_key:
+            print("[ERROR] GEMINI_API_KEY が設定されていません (.env を確認)")
+            sys.exit(1)
+        self._gemini = GeminiVisionEngine(api_key)
+        self._runner = AsyncAIRunner()
+
+        # --- 状態 ---
+        self._running = False
+        self._last_image = None
+        self._last_api_time = 0.0
+        self._start_time = 0.0
+        self._poll_id: str | None = None
+
+        # --- ウィンドウ ---
+        cap_rect = self._config.get_capture_rect()
+        self._capture_win = CaptureWindow(
+            self._root,
+            x=cap_rect["x"], y=cap_rect["y"],
+            w=cap_rect["w"], h=cap_rect["h"],
+            on_geometry_change=self._on_capture_geometry,
+        )
+
+        ans_rect = self._config.get_answer_window_rect()
+        self._answer_win = AnswerWindow(
+            self._root,
+            x=ans_rect["x"], y=ans_rect["y"],
+            w=ans_rect["w"], h=ans_rect["h"],
+            on_start_stop=self._toggle_running,
+            on_reset=self._reset,
+            on_settings=self._open_settings,
+            on_geometry_change=self._on_answer_geometry,
+        )
+        self._answer_win.set_close_callback(self._quit)
+        self._answer_win.set_engine_name("Gemini Vision")
+
+        # --- キーボードショートカット ---
+        self._root.bind_all("<Command-Shift-KeyPress-s>", lambda e: self._toggle_running())
+        self._root.bind_all("<Command-Shift-KeyPress-r>", lambda e: self._reset())
+
+    # ------------------------------------------------------------------
+    # 開始 / 停止 / リセット
+    # ------------------------------------------------------------------
+
+    def _toggle_running(self):
+        if self._running:
+            self._stop()
+        else:
+            self._start()
+
+    def _start(self):
+        self._running = True
+        self._start_time = time.time()
+        self._answer_win.set_running(True)
+        self._answer_win.set_status("稼働中", MINHAYA_GREEN)
+        self._capture_win.set_active(True)
+        self._schedule_tick()
+
+    def _stop(self):
+        self._running = False
+        if self._poll_id:
+            self._root.after_cancel(self._poll_id)
+            self._poll_id = None
+        self._answer_win.set_running(False)
+        self._answer_win.set_status("停止中", MINHAYA_TEXT_DIM)
+        self._capture_win.set_active(False)
+
+    def _reset(self):
+        self._stop()
+        self._last_image = None
+        self._last_api_time = 0.0
+        self._answer_win.set_question("")
+        self._answer_win.set_answer("")
+        self._answer_win.set_confidence(0)
+        self._answer_win.set_timer("")
+        self._answer_win.set_status("停止中", MINHAYA_TEXT_DIM)
+
+    # ------------------------------------------------------------------
+    # メインループ（after ベース）
+    # ------------------------------------------------------------------
+
+    def _schedule_tick(self):
+        if not self._running:
+            return
+        interval = self._config.capture_interval_ms
+        self._poll_id = self._root.after(interval, self._tick)
+
+    def _tick(self):
+        if not self._running:
+            return
+
+        # タイマー更新
+        elapsed = time.time() - self._start_time
+        self._answer_win.set_timer(f"{elapsed:.0f}s")
+
+        # AI 結果をポーリング
+        result = self._runner.poll()
+        if result is not None:
+            self._handle_ai_result(result)
+
+        # キャプチャ（枠を一瞬隠して撮影）
         try:
-            font = ImageFont.truetype("/System/Library/Fonts/ヒラギノ角ゴシック W6.ttc", font_size)
-        except:
-            font = self.font
-        draw.text(position, text, font=font, fill=color)
-        return cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
-
-    def ocr_apple_vision(self, frame):
-        """Apple Vision Frameworkで高速OCR"""
-        try:
-            # OpenCV BGR -> RGB -> PNG
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            pil_img = Image.fromarray(rgb)
-
-            # PILイメージをNSDataに変換
-            import io
-            buffer = io.BytesIO()
-            pil_img.save(buffer, format='PNG')
-            png_data = buffer.getvalue()
-            ns_data = NSData.dataWithBytes_length_(png_data, len(png_data))
-
-            # CGImageを作成
-            data_provider = Quartz.CGDataProviderCreateWithCFData(ns_data)
-            cg_image = Quartz.CGImageCreateWithPNGDataProvider(
-                data_provider, None, True, Quartz.kCGRenderingIntentDefault
-            )
-
-            if cg_image is None:
-                return ""
-
-            # Vision リクエスト
-            request = Vision.VNRecognizeTextRequest.alloc().init()
-            request.setRecognitionLevel_(Vision.VNRequestTextRecognitionLevelAccurate)
-            request.setRecognitionLanguages_(["ja", "en"])
-            request.setUsesLanguageCorrection_(True)
-
-            handler = Vision.VNImageRequestHandler.alloc().initWithCGImage_options_(cg_image, None)
-            success = handler.performRequests_error_([request], None)
-
-            if not success:
-                return ""
-
-            results = request.results()
-            if not results:
-                return ""
-
-            # テキスト抽出
-            texts = []
-            for observation in results:
-                text = observation.topCandidates_(1)[0].string()
-                texts.append(text)
-
-            return "\n".join(texts)
-
+            x, y, w, h = self._capture_win.get_region()
+            if w > 4 and h > 4:
+                self._capture_win.hide()
+                image = grab_region(x, y, w, h)
+                self._capture_win.show()
+                self._process_image(image)
         except Exception as e:
-            print(f"OCR Error: {e}")
-            return ""
+            self._capture_win.show()
+            self._answer_win.set_status(f"キャプチャエラー: {e}", MINHAYA_ORANGE)
 
-    def get_answer_async(self, question):
-        """非同期で回答を取得"""
-        if self.processing:
+        self._schedule_tick()
+
+    # ------------------------------------------------------------------
+    # 画像処理 → AI 送信
+    # ------------------------------------------------------------------
+
+    def _process_image(self, image):
+        # 画像変化チェック
+        if images_similar(image, self._last_image):
             return
 
-        # 類似度チェック（同じ質問は送らない）
-        if self._similar(question, self.last_sent_question):
+        self._last_image = image.copy()
+
+        # API 間隔チェック
+        now = time.time()
+        if now - self._last_api_time < self._config.api_interval:
             return
 
-        self.processing = True
-        self.last_sent_question = question
+        if self._runner.busy:
+            return
 
-        def fetch():
-            try:
-                response = self.client.messages.create(
-                    model="claude-sonnet-4-20250514",
-                    max_tokens=50,
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": f"""早押しクイズです。問題文の途中かもしれませんが、推測して答えを1つだけ簡潔に答えてください。
+        self._last_api_time = now
+        self._answer_win.set_status("Gemini に問い合わせ中...", MINHAYA_ORANGE)
+        self._runner.submit_image(self._gemini, image)
 
-問題: {question}
+    def _handle_ai_result(self, result: AIResult):
+        if result.error:
+            self._answer_win.set_status(f"エラー: {result.error[:60]}", MINHAYA_ORANGE)
+            self._answer_win.set_confidence(0.0)
+            return
 
-答え（単語のみ）:"""
-                        }
-                    ]
-                )
-                answer = response.content[0].text.strip()
-                with self.lock:
-                    self.current_answer = answer
-                print(f">>> {answer}")
-            except Exception as e:
-                print(f"API Error: {e}")
-            finally:
-                self.processing = False
+        answer = result.answer
+        # 回答とよみがなを分離 (例: "織田信長（おだのぶなが）")
+        reading = ""
+        if "（" in answer and "）" in answer:
+            idx = answer.index("（")
+            reading = answer[idx + 1:answer.index("）")]
+            main_answer = answer[:idx]
+        elif "(" in answer and ")" in answer:
+            idx = answer.index("(")
+            reading = answer[idx + 1:answer.index(")")]
+            main_answer = answer[:idx]
+        else:
+            main_answer = answer
 
-        thread = threading.Thread(target=fetch, daemon=True)
-        thread.start()
+        self._answer_win.set_answer(main_answer, reading)
+        self._answer_win.set_confidence(0.8)
+        self._answer_win.set_status("稼働中", MINHAYA_GREEN)
 
-    def _similar(self, s1, s2):
-        """2つの文字列が似ているかチェック"""
-        if not s1 or not s2:
-            return False
-        # 80%以上一致したら同じとみなす
-        shorter = min(len(s1), len(s2))
-        if shorter == 0:
-            return False
-        common = sum(c1 == c2 for c1, c2 in zip(s1, s2))
-        return common / shorter > 0.8
+    # ------------------------------------------------------------------
+    # 設定
+    # ------------------------------------------------------------------
 
-    def mouse_callback(self, event, x, y, flags, param):
-        """マウスイベント処理"""
-        if event == cv2.EVENT_LBUTTONDOWN:
-            self.selecting = True
-            self.selection_start = (x, y)
-            self.selection_end = (x, y)
-        elif event == cv2.EVENT_MOUSEMOVE and self.selecting:
-            self.selection_end = (x, y)
-        elif event == cv2.EVENT_LBUTTONUP:
-            self.selecting = False
-            self.selection_end = (x, y)
-            x1, y1 = self.selection_start
-            x2, y2 = self.selection_end
-            self.roi = (min(x1, x2), min(y1, y2), abs(x2-x1), abs(y2-y1))
-            if self.roi[2] > 10 and self.roi[3] > 10:
-                self.current_answer = "認識中..."
-                print(f"領域選択: {self.roi}")
-            else:
-                self.roi = None
+    def _open_settings(self):
+        was_running = self._running
+        if was_running:
+            self._stop()
+        SettingsDialog(
+            self._answer_win._win, self._config,
+            on_save=lambda cfg: self._on_settings_saved(cfg, was_running),
+        )
+
+    def _on_settings_saved(self, cfg: ConfigStore, restart: bool):
+        if restart:
+            self._start()
+
+    # ------------------------------------------------------------------
+    # ジオメトリ永続化
+    # ------------------------------------------------------------------
+
+    def _on_capture_geometry(self, x: int, y: int, w: int, h: int):
+        self._config.set_capture_rect(x, y, w, h)
+
+    def _on_answer_geometry(self, x: int, y: int, w: int, h: int):
+        self._config.set_answer_window_rect(x, y, w, h)
+
+    # ------------------------------------------------------------------
+    # 終了
+    # ------------------------------------------------------------------
+
+    def _quit(self):
+        self._stop()
+        cleanup_capture()
+        self._capture_win.destroy()
+        self._root.quit()
+
+    # ------------------------------------------------------------------
+    # 起動
+    # ------------------------------------------------------------------
 
     def run(self):
-        """メインループ"""
-        cap = cv2.VideoCapture(CAMERA_INDEX)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-
-        if not cap.isOpened():
-            print("カメラを開けませんでした")
-            return
-
-        window_name = 'Minhaya Solver'
-        cv2.namedWindow(window_name)
-        cv2.setMouseCallback(window_name, self.mouse_callback)
-
-        print("=== みんはやソルバー ===")
-        print("1. マウスで問題領域をドラッグして選択")
-        print("2. 'r'キーで領域リセット")
-        print("3. 'q'キーで終了")
-        print("=" * 30)
-
-        last_ocr_time = 0
-        ocr_interval = 0.15  # OCR間隔
-
-        try:
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    continue
-
-                display = frame.copy()
-                h, w = display.shape[:2]
-
-                # 選択中の領域を表示
-                if self.selecting and self.selection_start and self.selection_end:
-                    cv2.rectangle(display, self.selection_start, self.selection_end, (0, 255, 0), 2)
-
-                # 選択済み領域を表示
-                if self.roi:
-                    x, y, rw, rh = self.roi
-                    cv2.rectangle(display, (x, y), (x+rw, y+rh), (0, 255, 0), 2)
-
-                    # ROI内をOCR
-                    current_time = time.time()
-                    if current_time - last_ocr_time >= ocr_interval:
-                        last_ocr_time = current_time
-                        roi_frame = frame[y:y+rh, x:x+rw]
-                        if roi_frame.size > 0:
-                            text = self.ocr_apple_vision(roi_frame)
-                            if text and len(text) >= 3:
-                                self.current_question = text
-                                # 非同期で回答取得
-                                self.get_answer_async(text)
-
-                # 回答表示エリア
-                overlay = display.copy()
-                cv2.rectangle(overlay, (0, h-70), (w, h), (0, 0, 0), -1)
-                display = cv2.addWeighted(overlay, 0.8, display, 0.2, 0)
-
-                # 回答テキスト
-                with self.lock:
-                    answer_text = self.current_answer
-                display = self.put_japanese_text(display, f"回答: {answer_text}", (10, h-60), (0, 255, 0), 40)
-
-                # 検出テキスト（小さく表示）
-                if self.current_question:
-                    q_short = self.current_question[:40] + "..." if len(self.current_question) > 40 else self.current_question
-                    display = self.put_japanese_text(display, f"検出: {q_short}", (10, 10), (255, 255, 0), 20)
-
-                cv2.imshow(window_name, display)
-
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord('q'):
-                    break
-                elif key == ord('r'):
-                    self.roi = None
-                    self.current_answer = "領域を選択してください..."
-                    self.current_question = ""
-                    print("領域リセット")
-
-        finally:
-            cap.release()
-            cv2.destroyAllWindows()
+        self._root.mainloop()
 
 
 def main():
-    if not os.getenv('ANTHROPIC_API_KEY'):
-        print("Error: ANTHROPIC_API_KEY が設定されていません")
-        return
-
-    solver = MinhayaSolver()
-    solver.run()
+    app = MinhayaSolverApp()
+    app.run()
 
 
 if __name__ == "__main__":
