@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 import base64
+import http.client
 import io
 import json
 import ssl
+import time
 import threading
 import urllib.request
 from queue import Queue, Empty
@@ -19,7 +21,7 @@ from constants import (
     IMAGE_MAX_WIDTH, IMAGE_JPEG_QUALITY,
 )
 
-# Gemini 用に SSL 検証を緩和
+# SSL 検証を緩和
 ssl._create_default_https_context = ssl._create_unverified_context
 
 
@@ -60,20 +62,27 @@ class ClaudeEngine:
 class GeminiVisionEngine:
     """Google Gemini API（画像を直接送信 — OCR 不要）"""
 
+    _GEMINI_HOST = "generativelanguage.googleapis.com"
+
     def __init__(self, api_key: str):
         self._api_key = api_key
+        self._local = threading.local()  # スレッドごとにKeep-Alive接続を保持
+
+    def _get_conn(self) -> http.client.HTTPSConnection:
+        conn = getattr(self._local, 'conn', None)
+        if conn is None:
+            conn = http.client.HTTPSConnection(self._GEMINI_HOST, timeout=GEMINI_TIMEOUT)
+            self._local.conn = conn
+        return conn
 
     @staticmethod
     def _optimize_image(image: Image.Image) -> tuple[bytes, str]:
         """画像をリサイズ+JPEG圧縮して転送サイズを削減"""
         img = image
-        # リサイズ（幅が大きすぎる場合）
         if img.width > IMAGE_MAX_WIDTH:
             ratio = IMAGE_MAX_WIDTH / img.width
             new_h = int(img.height * ratio)
             img = img.resize((IMAGE_MAX_WIDTH, new_h), Image.LANCZOS)
-
-        # JPEG 圧縮（PNG の 1/5〜1/10 のサイズ）
         buf = io.BytesIO()
         rgb = img.convert("RGB") if img.mode != "RGB" else img
         rgb.save(buf, format="JPEG", quality=IMAGE_JPEG_QUALITY)
@@ -84,32 +93,26 @@ class GeminiVisionEngine:
         """Gemini レスポンスから回答と確信度をパース"""
         import re
         confidence = 0.0
-
-        # 確信度を抽出
         conf_match = re.search(r'確信度\s*[:：]\s*(\d+)', text)
         if conf_match:
             confidence = min(100, max(0, int(conf_match.group(1)))) / 100.0
 
-        # 答えを抽出
         answer = "不明"
         ans_match = re.search(r'答え\s*[:：]\s*(.+)', text)
         if ans_match:
             raw = ans_match.group(1).strip()
             raw = re.split(r'\n|確信度', raw)[0].strip()
-            # 長すぎる回答（20文字超）は説明文と判断して不明にする
-            if len(raw) <= 30 and raw:
-                answer = raw
-            else:
-                answer = "不明"
-                confidence = 0.0
         else:
-            # 形式に従っていない → 不明
+            lines = text.strip().split('\n')
+            raw = re.split(r'確信度', lines[0])[0].strip() if lines else ""
+
+        if raw and len(raw) <= 30 and raw != "不明":
+            answer = raw
+        else:
             answer = "不明"
             confidence = 0.0
-
         if answer == "不明":
             confidence = 0.0
-
         return answer, confidence
 
     def ask_with_image(self, image: Image.Image,
@@ -118,7 +121,6 @@ class GeminiVisionEngine:
             img_bytes, mime_type = self._optimize_image(image)
             img_b64 = base64.b64encode(img_bytes).decode("utf-8")
 
-            # 前回の推測があればコンテキストに含める
             if prev_answer and prev_confidence > 0:
                 context = GEMINI_CONTEXT_TEMPLATE.format(
                     prev_answer=prev_answer, prev_confidence=prev_confidence)
@@ -134,82 +136,125 @@ class GeminiVisionEngine:
                     ]
                 }],
                 "generationConfig": {
-                    "maxOutputTokens": 60,
+                    "maxOutputTokens": 30,
                     "temperature": 0.0,
-                    "thinkingConfig": {
-                        "thinkingBudget": 0,
-                    },
                 },
             }).encode()
 
-            url = (
-                f"https://generativelanguage.googleapis.com/v1beta/"
-                f"models/{GEMINI_MODEL}:generateContent?key={self._api_key}"
-            )
-            req = urllib.request.Request(
-                url, data=payload,
-                headers={"Content-Type": "application/json"},
-            )
-            with urllib.request.urlopen(req, timeout=GEMINI_TIMEOUT) as res:
-                body = json.loads(res.read())
-                text = body["candidates"][0]["content"]["parts"][0]["text"].strip()
-                answer, confidence = self._parse_response(text)
-                print(f"[DEBUG] Gemini raw: {text!r}")
-                return AIResult(answer=answer, confidence=confidence)
+            path = (f"/v1beta/models/{GEMINI_MODEL}:generateContent"
+                    f"?key={self._api_key}")
+            headers = {"Content-Type": "application/json"}
 
-        except urllib.error.HTTPError as e:
-            error_body = e.read().decode("utf-8", errors="replace")
-            return AIResult(error=f"HTTP {e.code}: {error_body}")
+            # Keep-Alive 接続でリクエスト（切れてたら再接続）
+            conn = self._get_conn()
+            for attempt in range(2):
+                try:
+                    conn.request("POST", path, body=payload, headers=headers)
+                    resp = conn.getresponse()
+                    data = resp.read()
+                    if resp.status != 200:
+                        return AIResult(error=f"HTTP {resp.status}: {data.decode()[:200]}")
+                    break
+                except Exception:
+                    if attempt == 0:
+                        conn.close()
+                        conn = http.client.HTTPSConnection(
+                            self._GEMINI_HOST, timeout=GEMINI_TIMEOUT)
+                        self._local.conn = conn
+                    else:
+                        raise
+
+            body = json.loads(data)
+            text = body["candidates"][0]["content"]["parts"][0]["text"].strip()
+            answer, confidence = self._parse_response(text)
+            print(f"[DEBUG] Gemini raw: {text!r}")
+            return AIResult(answer=answer, confidence=confidence)
+
         except Exception as e:
             return AIResult(error=str(e))
 
 
-# === 非同期ラッパー ===
+# === 非同期ラッパー（並列対応） ===
 
 class AsyncAIRunner:
-    """AI 推論をバックグラウンドスレッドで実行し、結果を Queue に返す。
+    """AI 推論をバックグラウンドスレッドで並列実行。
 
-    メインスレッド側は `poll()` で結果を取り出す。
+    max_concurrent 本のリクエストを同時に飛ばし、
+    結果は送信順のタイムスタンプ付きで Queue に返す。
+    古い結果は自動的に捨てる。
     """
 
-    def __init__(self):
-        self._queue: Queue[AIResult] = Queue()
-        self._busy = False
+    def __init__(self, max_concurrent: int = 5):
+        self._queue: Queue[tuple[float, AIResult]] = Queue()  # (timestamp, result)
+        self._in_flight = 0
+        self._lock = threading.Lock()
+        self._max_concurrent = max_concurrent
+        self._latest_displayed_ts = 0.0  # 最後に表示した結果のタイムスタンプ
 
     @property
     def busy(self) -> bool:
-        return self._busy
+        with self._lock:
+            return self._in_flight >= self._max_concurrent
 
-    def submit_text(self, engine: ClaudeEngine, question: str):
-        """Claude 用: テキスト質問を非同期送信"""
-        if self._busy:
-            return
-        self._busy = True
+    @property
+    def in_flight(self) -> int:
+        with self._lock:
+            return self._in_flight
 
-        def _run():
-            result = engine.ask(question)
-            self._queue.put(result)
-            self._busy = False
+    def submit_image(self, engine, image: Image.Image,
+                     prev_answer: str = "", prev_confidence: int = 0,
+                     capture_time: float = 0.0,
+                     image_name: str = "") -> bool:
+        """Gemini 用: 画像を非同期送信。空きスロットがあれば送信して True を返す。"""
+        from datetime import datetime
+        with self._lock:
+            if self._in_flight >= self._max_concurrent:
+                return False
+            self._in_flight += 1
 
-        threading.Thread(target=_run, daemon=True).start()
+        ts = time.time()
+        cap_ts = capture_time or ts
 
-    def submit_image(self, engine: GeminiVisionEngine, image: Image.Image,
-                     prev_answer: str = "", prev_confidence: int = 0):
-        """Gemini 用: 画像を非同期送信（前回の推測コンテキスト付き）"""
-        if self._busy:
-            return
-        self._busy = True
+        def _fmt(t: float) -> str:
+            dt = datetime.fromtimestamp(t)
+            return dt.strftime("%H:%M:%S") + f".{dt.microsecond // 10000:02d}"
 
         def _run():
             result = engine.ask_with_image(image, prev_answer, prev_confidence)
-            self._queue.put(result)
-            self._busy = False
+            now = time.time()
+            cap_to_send = ts - cap_ts
+            api_elapsed = now - ts
+            cap_to_result = now - cap_ts
+            print(f"[TIMING] {image_name} | "
+                  f"キャプチャ: {_fmt(cap_ts)} → 到着: {_fmt(now)} | "
+                  f"撮影→送信: {cap_to_send:.2f}秒 / API: {api_elapsed:.2f}秒 / 撮影→到着: {cap_to_result:.2f}秒")
+            self._queue.put((ts, result))
+            with self._lock:
+                self._in_flight -= 1
 
         threading.Thread(target=_run, daemon=True).start()
+        return True
 
     def poll(self) -> AIResult | None:
-        """キューから結果を取り出す（ノンブロッキング）"""
-        try:
-            return self._queue.get_nowait()
-        except Empty:
-            return None
+        """キューから最新の結果を取り出す（古い結果はスキップ）"""
+        latest_result = None
+        latest_ts = self._latest_displayed_ts
+
+        # キューに溜まっている結果を全部取り出し、最新のものだけ返す
+        while True:
+            try:
+                ts, result = self._queue.get_nowait()
+                if ts > latest_ts:
+                    latest_ts = ts
+                    latest_result = result
+            except Empty:
+                break
+
+        if latest_result is not None:
+            self._latest_displayed_ts = latest_ts
+
+        return latest_result
+
+    def reset(self):
+        """タイムスタンプをリセット（リセットボタン用）"""
+        self._latest_displayed_ts = 0.0

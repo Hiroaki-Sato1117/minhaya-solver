@@ -39,7 +39,13 @@ class CaptureWindow:
         self._win.geometry(f"{w}x{h}+{x}+{y}")
         self._win.overrideredirect(True)
         self._win.attributes("-topmost", True)
-        self._win.attributes("-alpha", _NORMAL_ALPHA)
+        self._win.attributes("-alpha", 1.0)
+
+        # macOS: ウィンドウ背景を透明にする
+        try:
+            self._win.wm_attributes("-transparent", True)
+        except Exception:
+            pass
 
         # macOS: overrideredirect ウィンドウのフォーカス固着を防止
         try:
@@ -48,9 +54,9 @@ class CaptureWindow:
         except Exception:
             pass
 
-        # Canvas
+        # Canvas（背景を systemTransparent に）
         self._canvas = tk.Canvas(
-            self._win, highlightthickness=0, bg="#000000",
+            self._win, highlightthickness=0, bg="systemTransparent",
         )
         self._canvas.pack(fill="both", expand=True)
 
@@ -95,12 +101,12 @@ class CaptureWindow:
         """キャプチャ前に完全透明にする（withdraw より高速・安定）"""
         self._win.attributes("-alpha", 0.0)
         self._win.update_idletasks()
-        # macOS の WindowServer が反映するまで待機
-        time.sleep(0.05)
+        # macOS の WindowServer が反映するまで待機（最小限）
+        time.sleep(0.02)
 
     def show(self):
         """キャプチャ後に復帰"""
-        self._win.attributes("-alpha", _NORMAL_ALPHA)
+        self._win.attributes("-alpha", 1.0)
 
     def destroy(self):
         self._win.destroy()
@@ -115,8 +121,8 @@ class CaptureWindow:
         b = _BORDER
         border_color = CAPTURE_BORDER_ACTIVE if self._active else CAPTURE_BORDER_COLOR
 
-        # 中央を暗い半透明に（枠は明るい色）
-        c.create_rectangle(b, b, w - b, h - b, fill="#111111", outline="")
+        # 中央を透明に（枠だけ表示）
+        c.create_rectangle(b, b, w - b, h - b, fill="systemTransparent", outline="")
 
         # 4辺の枠
         c.create_rectangle(0, 0, w, b, fill=border_color, outline="")       # 上

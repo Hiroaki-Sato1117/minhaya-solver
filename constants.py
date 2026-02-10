@@ -17,8 +17,8 @@ OCR_MIN_TEXT_LENGTH = 3            # OCR 最低文字数
 # --- AI モデル ---
 CLAUDE_MODEL = "claude-sonnet-4-20250514"
 CLAUDE_MAX_TOKENS = 50
-GEMINI_MODEL = "gemini-2.5-flash"
-GEMINI_TIMEOUT = 15
+GEMINI_MODEL = "gemini-2.0-flash"
+GEMINI_TIMEOUT = 10
 
 # --- キャプチャウィンドウ デフォルト ---
 CAPTURE_DEFAULT_X = 100
@@ -67,15 +67,10 @@ CLAUDE_PROMPT_TEMPLATE = """早押しクイズです。問題文の途中かも�
 答え（単語のみ）:"""
 
 GEMINI_PROMPT = (
-    "早押しクイズ。画像の問題文から答えを推測せよ。\n"
-    "【絶対ルール】\n"
-    "・答えの単語だけを返せ。説明・描写・文章は一切禁止。\n"
-    "・分からなければ「不明」とだけ返せ。\n"
-    "・漢字には読みをカッコで付けろ。\n"
+    "早押しクイズ。画像から答えを推測。\n"
+    "単語のみ回答。説明禁止。不明なら「不明」。漢字は読み付き。\n"
     "{context}"
-    "形式（厳守・2行のみ）:\n"
-    "答え:単語（よみがな）\n"
-    "確信度:0-100"
+    "答え:単語（よみ）\n確信度:0-100"
 )
 
 # 前回の推測を含めるテンプレート
@@ -84,4 +79,4 @@ GEMINI_CONTEXT_EMPTY = ""
 
 # 画像最適化
 IMAGE_MAX_WIDTH = 640              # API送信前の最大幅 (px)
-IMAGE_JPEG_QUALITY = 70            # JPEG圧縮品質（速度優先）
+IMAGE_JPEG_QUALITY = 70            # JPEG圧縮品質

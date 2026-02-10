@@ -23,8 +23,8 @@ from ui.settings_dialog import SettingsDialog
 # デバッグ用: キャプチャ画像の保存先
 DEBUG_DIR = os.path.expanduser("~/Desktop/minhaya_debug")
 
-# キャプチャループ間隔 (ms)
-_CAPTURE_TICK_MS = 50
+# キャプチャループ間隔 (ms) — 秒間5枚
+_CAPTURE_TICK_MS = 180
 
 
 class MinhayaSolverApp:
@@ -48,13 +48,13 @@ class MinhayaSolverApp:
         self._root = ctk.CTk()
         self._root.withdraw()
 
-        # --- AI エンジン (Gemini Vision のみ) ---
+        # --- AI エンジン (Gemini Vision) ---
         api_key = os.getenv("GEMINI_API_KEY", "")
         if not api_key:
             print("[ERROR] GEMINI_API_KEY が設定されていません (.env を確認)")
             sys.exit(1)
-        self._gemini = GeminiVisionEngine(api_key)
-        self._runner = AsyncAIRunner()
+        self._engine = GeminiVisionEngine(api_key)
+        self._runner = AsyncAIRunner(max_concurrent=7)
 
         # --- 状態 ---
         self._capturing = False           # キャプチャON/OFF
@@ -63,6 +63,7 @@ class MinhayaSolverApp:
         self._last_sent_image = None      # 最後にAPIに送った画像
         self._start_time = 0.0
         self._poll_id: str | None = None
+        self._capture_count = 0
         self._api_send_count = 0
         # 前回の推測（累積コンテキスト）
         self._prev_answer = ""
@@ -112,6 +113,7 @@ class MinhayaSolverApp:
 
     def _start_capture(self):
         self._capturing = True
+        self._capture_count = 0
         self._capture_win.set_active(True)
         self._answer_win.set_capture_active(True)
         self._answer_win.set_status("キャプチャ中 — AI開始を押してください", "#1565C0")
@@ -165,6 +167,7 @@ class MinhayaSolverApp:
         self._last_sent_image = None
         self._prev_answer = ""
         self._prev_confidence = 0
+        self._runner.reset()
         self._answer_win.set_answer("")
         self._answer_win.set_confidence(0)
         if self._capturing:
@@ -185,18 +188,16 @@ class MinhayaSolverApp:
         if not self._capturing:
             return
 
-        # AI 結果をポーリング
+        # AI 結果をポーリング（最新のものだけ取得）
         result = self._runner.poll()
         if result is not None:
             self._handle_ai_result(result)
-            # パイプライン: 結果が返ったら即座に次を送信
-            if self._api_active:
-                self._try_send_api()
 
         # タイマー更新
         if self._api_active:
             elapsed = time.time() - self._start_time
-            self._answer_win.set_timer(f"{elapsed:.0f}s")
+            in_flight = self._runner.in_flight
+            self._answer_win.set_timer(f"{elapsed:.0f}s ({in_flight}並列)")
 
         # キャプチャ（枠を一瞬隠して撮影）
         try:
@@ -206,11 +207,17 @@ class MinhayaSolverApp:
                 image = grab_region(x, y, w, h)
                 self._capture_win.show()
                 self._latest_image = image
+                self._latest_capture_time = time.time()
+                self._capture_count += 1
+                # デバッグ: 最初の5枚 + 以後50枚ごとに保存
+                if self._capture_count <= 5 or self._capture_count % 50 == 0:
+                    path = os.path.join(DEBUG_DIR, f"cap_{self._capture_count:04d}.png")
+                    image.save(path)
         except Exception:
             self._capture_win.show()
 
-        # API アクティブかつ空いていたら送信
-        if self._api_active and not self._runner.busy:
+        # API アクティブなら毎tick送信を試みる（並列スロットが空いていれば送る）
+        if self._api_active:
             self._try_send_api()
 
         self._schedule_tick()
@@ -222,10 +229,10 @@ class MinhayaSolverApp:
     def _try_send_api(self):
         if not self._api_active:
             return
-        if self._runner.busy:
-            return
         if self._latest_image is None:
             return
+        if self._runner.busy:
+            return  # 並列スロット満杯
 
         # 同じ画像は送らない
         if images_similar(self._latest_image, self._last_sent_image):
@@ -233,20 +240,23 @@ class MinhayaSolverApp:
 
         self._last_sent_image = self._latest_image.copy()
         self._api_send_count += 1
-        self._answer_win.set_status(
-            f"AI問い合わせ中... (#{self._api_send_count})", MINHAYA_ORANGE)
 
-        # デバッグ: 最初の3枚 + 以後10枚ごと
-        if self._api_send_count <= 3 or self._api_send_count % 10 == 0:
-            path = os.path.join(DEBUG_DIR, f"api_{self._api_send_count:04d}.png")
+        # デバッグ: 最初の5枚 + 以後20枚ごとに保存
+        fname = f"api_{self._api_send_count:04d}.png"
+        if self._api_send_count <= 5 or self._api_send_count % 20 == 0:
+            path = os.path.join(DEBUG_DIR, fname)
             self._latest_image.save(path)
-            print(f"[DEBUG] API送信 #{self._api_send_count}: {path}")
 
-        self._runner.submit_image(
-            self._gemini, self._latest_image,
+        sent = self._runner.submit_image(
+            self._engine, self._latest_image,
             prev_answer=self._prev_answer,
             prev_confidence=self._prev_confidence,
+            capture_time=getattr(self, '_latest_capture_time', 0.0),
+            image_name=fname,
         )
+        if sent:
+            self._answer_win.set_status(
+                f"AI送信中 (#{self._api_send_count})", MINHAYA_ORANGE)
 
     # ------------------------------------------------------------------
     # AI結果ハンドリング
@@ -262,6 +272,7 @@ class MinhayaSolverApp:
         answer = result.answer
         confidence = result.confidence
         print(f"[DEBUG] Gemini 回答: '{answer}' 確信度: {confidence:.0%}")
+
 
         # 不明の場合
         if answer == "不明":
