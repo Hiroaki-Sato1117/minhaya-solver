@@ -23,12 +23,18 @@ from ui.settings_dialog import SettingsDialog
 # デバッグ用: キャプチャ画像の保存先
 DEBUG_DIR = os.path.expanduser("~/Desktop/minhaya_debug")
 
+# キャプチャループ間隔 (ms)
+_CAPTURE_TICK_MS = 50
+
 
 class MinhayaSolverApp:
     """メインオーケストレーター
 
-    - after() でキャプチャループを駆動（tkinter メインスレッド）
-    - AI 推論のみバックグラウンドスレッド
+    操作フロー:
+    1. キャプチャ枠を配置
+    2. 「キャプチャ開始」→ 画面撮影が始まる
+    3. 問題が来たら「AI開始」→ Gemini に連続送信
+    4. 問題が終わったら「AI停止」→ API課金ストップ
     """
 
     def __init__(self):
@@ -51,12 +57,13 @@ class MinhayaSolverApp:
         self._runner = AsyncAIRunner()
 
         # --- 状態 ---
-        self._running = False
-        self._last_image = None
-        self._last_api_time = 0.0
+        self._capturing = False           # キャプチャON/OFF
+        self._api_active = False          # AI送信ON/OFF
+        self._latest_image = None         # 最新のキャプチャ画像
+        self._last_sent_image = None      # 最後にAPIに送った画像
         self._start_time = 0.0
         self._poll_id: str | None = None
-        self._capture_count = 0
+        self._api_send_count = 0
         # 前回の推測（累積コンテキスト）
         self._prev_answer = ""
         self._prev_confidence = 0  # 0-100
@@ -73,134 +80,123 @@ class MinhayaSolverApp:
             on_geometry_change=self._on_capture_geometry,
             on_focus_release=self._focus_answer_window,
         )
+        self._capture_win.set_active(False)
 
         ans_rect = self._config.get_answer_window_rect()
         self._answer_win = AnswerWindow(
             self._root,
             x=ans_rect["x"], y=ans_rect["y"],
             w=ans_rect["w"], h=ans_rect["h"],
-            on_start_stop=self._toggle_running,
+            on_capture_toggle=self._toggle_capture,
+            on_ai_toggle=self._toggle_api,
             on_reset=self._reset,
             on_settings=self._open_settings,
-            on_test_capture=self._test_capture,
             on_geometry_change=self._on_answer_geometry,
         )
         self._answer_win.set_close_callback(self._quit)
-        self._answer_win.set_engine_name("Gemini Vision")
 
         # --- キーボードショートカット ---
-        self._root.bind_all("<Command-Shift-KeyPress-s>", lambda e: self._toggle_running())
+        self._root.bind_all("<Command-Shift-KeyPress-c>", lambda e: self._toggle_capture())
+        self._root.bind_all("<Command-Shift-KeyPress-s>", lambda e: self._toggle_api())
         self._root.bind_all("<Command-Shift-KeyPress-r>", lambda e: self._reset())
 
     # ------------------------------------------------------------------
-    # 開始 / 停止 / リセット
+    # キャプチャ ON/OFF
     # ------------------------------------------------------------------
 
-    def _toggle_running(self):
-        if self._running:
-            self._stop()
+    def _toggle_capture(self):
+        if self._capturing:
+            self._stop_capture()
         else:
-            self._start()
+            self._start_capture()
 
-    def _start(self):
-        self._running = True
-        self._start_time = time.time()
-        self._capture_count = 0
-        self._answer_win.set_running(True)
-        self._answer_win.set_status("稼働中", MINHAYA_GREEN)
+    def _start_capture(self):
+        self._capturing = True
         self._capture_win.set_active(True)
+        self._answer_win.set_capture_active(True)
+        self._answer_win.set_status("キャプチャ中 — AI開始を押してください", "#1565C0")
         self._schedule_tick()
 
-    def _stop(self):
-        self._running = False
+    def _stop_capture(self):
+        # AI も止める
+        if self._api_active:
+            self._stop_api()
+        self._capturing = False
         if self._poll_id:
             self._root.after_cancel(self._poll_id)
             self._poll_id = None
-        self._answer_win.set_running(False)
-        self._answer_win.set_status("停止中", MINHAYA_TEXT_DIM)
         self._capture_win.set_active(False)
+        self._answer_win.set_capture_active(False)
+        self._answer_win.set_status("キャプチャ停止", MINHAYA_TEXT_DIM)
+        self._answer_win.set_timer("")
+
+    # ------------------------------------------------------------------
+    # AI送信 ON/OFF
+    # ------------------------------------------------------------------
+
+    def _toggle_api(self):
+        if not self._capturing:
+            return  # キャプチャ中でないとAIは使えない
+        if self._api_active:
+            self._stop_api()
+        else:
+            self._start_api()
+
+    def _start_api(self):
+        self._api_active = True
+        self._start_time = time.time()
+        self._api_send_count = 0
+        self._answer_win.set_api_active(True)
+        self._answer_win.set_status("AI送信中", MINHAYA_GREEN)
+        # 即座に最新画像を送信
+        self._try_send_api()
+
+    def _stop_api(self):
+        self._api_active = False
+        self._answer_win.set_api_active(False)
+        if self._capturing:
+            self._answer_win.set_status("キャプチャ中 — AI停止", "#1565C0")
+        else:
+            self._answer_win.set_status("停止", MINHAYA_TEXT_DIM)
+        self._answer_win.set_timer("")
 
     def _reset(self):
-        self._stop()
-        self._last_image = None
-        self._last_api_time = 0.0
+        self._stop_api()
+        self._last_sent_image = None
         self._prev_answer = ""
         self._prev_confidence = 0
-        self._answer_win.set_question("")
         self._answer_win.set_answer("")
         self._answer_win.set_confidence(0)
-        self._answer_win.set_timer("")
-        self._answer_win.set_status("停止中", MINHAYA_TEXT_DIM)
+        if self._capturing:
+            self._answer_win.set_status("キャプチャ中 — AI開始を押してください", "#1565C0")
+        else:
+            self._answer_win.set_status("キャプチャ枠を配置してください", MINHAYA_TEXT_DIM)
 
     # ------------------------------------------------------------------
-    # テストキャプチャ（デバッグ用）
-    # ------------------------------------------------------------------
-
-    def _test_capture(self):
-        """現在のキャプチャ領域を1枚撮影してデスクトップに保存"""
-        try:
-            x, y, w, h = self._capture_win.get_region()
-            print(f"[DEBUG] キャプチャ領域: x={x}, y={y}, w={w}, h={h}")
-            self._answer_win.set_status(f"テスト: ({x},{y}) {w}x{h}", MINHAYA_ORANGE)
-
-            if w < 4 or h < 4:
-                self._answer_win.set_status("エラー: キャプチャ領域が小さすぎます", MINHAYA_ORANGE)
-                return
-
-            # alpha=0 で撮影
-            self._capture_win.hide()
-            image = grab_region(x, y, w, h)
-            self._capture_win.show()
-
-            # デスクトップに保存
-            path = os.path.join(DEBUG_DIR, f"test_capture_{int(time.time())}.png")
-            image.save(path)
-            print(f"[DEBUG] テストキャプチャ保存: {path}")
-            print(f"[DEBUG] 画像サイズ: {image.size}, モード: {image.mode}")
-
-            # 画像の明るさチェック
-            import numpy as np
-            arr = np.array(image)
-            mean_brightness = arr.mean()
-            print(f"[DEBUG] 平均輝度: {mean_brightness:.1f} (0=真っ黒, 255=真っ白)")
-
-            self._answer_win.set_status(
-                f"保存: ~/Desktop/minhaya_debug/ 輝度:{mean_brightness:.0f}",
-                MINHAYA_GREEN,
-            )
-            self._answer_win.set_question(
-                f"テストキャプチャ完了\n領域: ({x},{y}) {w}×{h}px\n"
-                f"画像: {image.size[0]}×{image.size[1]}px  輝度: {mean_brightness:.0f}"
-            )
-
-        except Exception as e:
-            self._answer_win.set_status(f"テストエラー: {e}", MINHAYA_ORANGE)
-            print(f"[DEBUG] テストキャプチャエラー: {e}")
-            import traceback
-            traceback.print_exc()
-
-    # ------------------------------------------------------------------
-    # メインループ（after ベース）
+    # メインループ（50ms tick）
     # ------------------------------------------------------------------
 
     def _schedule_tick(self):
-        if not self._running:
+        if not self._capturing:
             return
-        interval = self._config.capture_interval_ms
-        self._poll_id = self._root.after(interval, self._tick)
+        self._poll_id = self._root.after(_CAPTURE_TICK_MS, self._tick)
 
     def _tick(self):
-        if not self._running:
+        if not self._capturing:
             return
-
-        # タイマー更新
-        elapsed = time.time() - self._start_time
-        self._answer_win.set_timer(f"{elapsed:.0f}s")
 
         # AI 結果をポーリング
         result = self._runner.poll()
         if result is not None:
             self._handle_ai_result(result)
+            # パイプライン: 結果が返ったら即座に次を送信
+            if self._api_active:
+                self._try_send_api()
+
+        # タイマー更新
+        if self._api_active:
+            elapsed = time.time() - self._start_time
+            self._answer_win.set_timer(f"{elapsed:.0f}s")
 
         # キャプチャ（枠を一瞬隠して撮影）
         try:
@@ -209,62 +205,52 @@ class MinhayaSolverApp:
                 self._capture_win.hide()
                 image = grab_region(x, y, w, h)
                 self._capture_win.show()
-                self._process_image(image)
-        except Exception as e:
+                self._latest_image = image
+        except Exception:
             self._capture_win.show()
-            self._answer_win.set_status(f"キャプチャエラー: {e}", MINHAYA_ORANGE)
+
+        # API アクティブかつ空いていたら送信
+        if self._api_active and not self._runner.busy:
+            self._try_send_api()
 
         self._schedule_tick()
 
     # ------------------------------------------------------------------
-    # 画像処理 → AI 送信
+    # API送信（パイプライン方式）
     # ------------------------------------------------------------------
 
-    def _process_image(self, image):
-        # 画像変化チェック
-        if images_similar(image, self._last_image):
+    def _try_send_api(self):
+        if not self._api_active:
             return
-
-        self._last_image = image.copy()
-        self._capture_count += 1
-
-        # デバッグ: 最初の3枚 + その後は10枚ごとに保存
-        if self._capture_count <= 3 or self._capture_count % 10 == 0:
-            path = os.path.join(DEBUG_DIR, f"cap_{self._capture_count:04d}.png")
-            image.save(path)
-            print(f"[DEBUG] キャプチャ #{self._capture_count} 保存: {path}")
-
-        # 適応的API間隔: 確信度が低い → より頻繁に問い合わせ
-        now = time.time()
-        base_interval = self._config.api_interval
-        if self._prev_confidence >= 80:
-            # 高確信度 → 間隔を伸ばす（ほぼ確定なので節約）
-            interval = base_interval * 2.0
-        elif self._prev_confidence >= 50:
-            interval = base_interval
-        else:
-            # 低確信度 → 最短間隔で積極的に更新
-            interval = base_interval * 0.5
-
-        if now - self._last_api_time < interval:
-            return
-
         if self._runner.busy:
             return
+        if self._latest_image is None:
+            return
 
-        self._last_api_time = now
-        self._answer_win.set_status("Gemini に問い合わせ中...", MINHAYA_ORANGE)
+        # 同じ画像は送らない
+        if images_similar(self._latest_image, self._last_sent_image):
+            return
 
-        # API に送る画像も保存
-        api_path = os.path.join(DEBUG_DIR, f"api_send_{int(now)}.png")
-        image.save(api_path)
-        print(f"[DEBUG] API送信画像: {api_path} (前回: {self._prev_answer} {self._prev_confidence}%)")
+        self._last_sent_image = self._latest_image.copy()
+        self._api_send_count += 1
+        self._answer_win.set_status(
+            f"AI問い合わせ中... (#{self._api_send_count})", MINHAYA_ORANGE)
+
+        # デバッグ: 最初の3枚 + 以後10枚ごと
+        if self._api_send_count <= 3 or self._api_send_count % 10 == 0:
+            path = os.path.join(DEBUG_DIR, f"api_{self._api_send_count:04d}.png")
+            self._latest_image.save(path)
+            print(f"[DEBUG] API送信 #{self._api_send_count}: {path}")
 
         self._runner.submit_image(
-            self._gemini, image,
+            self._gemini, self._latest_image,
             prev_answer=self._prev_answer,
             prev_confidence=self._prev_confidence,
         )
+
+    # ------------------------------------------------------------------
+    # AI結果ハンドリング
+    # ------------------------------------------------------------------
 
     def _handle_ai_result(self, result: AIResult):
         if result.error:
@@ -281,8 +267,8 @@ class MinhayaSolverApp:
         if answer == "不明":
             self._answer_win.set_answer("不明")
             self._answer_win.set_confidence(0.0)
-            self._answer_win.set_status("稼働中 — 解答不明", MINHAYA_ORANGE)
-            # 不明の場合は前回コンテキストをクリアして再挑戦
+            if self._api_active:
+                self._answer_win.set_status("AI送信中 — 解答不明", MINHAYA_ORANGE)
             self._prev_answer = ""
             self._prev_confidence = 0
             return
@@ -300,37 +286,43 @@ class MinhayaSolverApp:
         else:
             main_answer = answer
 
-        # 前回の推測を保存（次回APIで累積コンテキストとして使用）
+        # 前回の推測を保存
         self._prev_answer = main_answer + (f"（{reading}）" if reading else "")
         self._prev_confidence = int(confidence * 100)
 
         self._answer_win.set_answer(main_answer, reading)
         self._answer_win.set_confidence(confidence)
-        self._answer_win.set_status(f"稼働中 — 確信度 {confidence:.0%}", MINHAYA_GREEN)
+        if self._api_active:
+            self._answer_win.set_status(
+                f"AI送信中 — 確信度 {confidence:.0%}", MINHAYA_GREEN)
 
     # ------------------------------------------------------------------
     # 設定
     # ------------------------------------------------------------------
 
     def _open_settings(self):
-        was_running = self._running
-        if was_running:
-            self._stop()
+        was_api = self._api_active
+        was_cap = self._capturing
+        if was_api:
+            self._stop_api()
+        if was_cap:
+            self._stop_capture()
         SettingsDialog(
             self._answer_win._win, self._config,
-            on_save=lambda cfg: self._on_settings_saved(cfg, was_running),
+            on_save=lambda cfg: self._on_settings_saved(cfg, was_cap, was_api),
         )
 
-    def _on_settings_saved(self, cfg: ConfigStore, restart: bool):
-        if restart:
-            self._start()
+    def _on_settings_saved(self, cfg: ConfigStore, restart_cap: bool, restart_api: bool):
+        if restart_cap:
+            self._start_capture()
+        if restart_api:
+            self._start_api()
 
     # ------------------------------------------------------------------
     # フォーカス管理
     # ------------------------------------------------------------------
 
     def _focus_answer_window(self):
-        """キャプチャウィンドウ操作後、回答ウィンドウにフォーカスを戻す"""
         try:
             self._answer_win._win.lift()
             self._answer_win._win.focus_force()
@@ -352,7 +344,12 @@ class MinhayaSolverApp:
     # ------------------------------------------------------------------
 
     def _quit(self):
-        self._stop()
+        if self._api_active:
+            self._stop_api()
+        if self._capturing:
+            self._stop_capture()
+        if self._poll_id:
+            self._root.after_cancel(self._poll_id)
         cleanup_capture()
         self._capture_win.destroy()
         self._root.quit()
@@ -363,7 +360,9 @@ class MinhayaSolverApp:
 
     def run(self):
         print(f"[INFO] デバッグ画像保存先: {DEBUG_DIR}")
-        print(f"[INFO] Cmd+Shift+S: 開始/停止  Cmd+Shift+R: リセット")
+        print(f"[INFO] Cmd+Shift+C: キャプチャ開始/停止")
+        print(f"[INFO] Cmd+Shift+S: AI送信 開始/停止")
+        print(f"[INFO] Cmd+Shift+R: リセット")
         self._root.mainloop()
 
 

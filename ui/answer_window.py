@@ -15,30 +15,29 @@ from ui.styles import (
 
 
 class AnswerWindow:
-    """みんはや風の回答ウィンドウ
+    """回答表示ウィンドウ
 
-    レイアウト戦略: ボタン・ステータスを先に pack(side="bottom") し、
-    ウィンドウが小さくても操作部分が見切れないようにする。
+    ボタン: キャプチャ開始/停止、AI開始/停止、リセット、設定
     """
 
     def __init__(self, root: ctk.CTk, *,
                  x: int, y: int, w: int, h: int,
-                 on_start_stop: Callable[[], None] | None = None,
+                 on_capture_toggle: Callable[[], None] | None = None,
+                 on_ai_toggle: Callable[[], None] | None = None,
                  on_reset: Callable[[], None] | None = None,
                  on_settings: Callable[[], None] | None = None,
-                 on_test_capture: Callable[[], None] | None = None,
                  on_geometry_change: Callable[[int, int, int, int], None] | None = None):
-        self._on_start_stop = on_start_stop
+        self._on_capture_toggle = on_capture_toggle
+        self._on_ai_toggle = on_ai_toggle
         self._on_reset = on_reset
         self._on_settings = on_settings
-        self._on_test_capture = on_test_capture
         self._on_geometry_change = on_geometry_change
 
         self._win = ctk.CTkToplevel(root)
         self._win.title("みんはやソルバー v2.0")
         self._win.geometry(f"{w}x{h}+{x}+{y}")
         self._win.configure(fg_color=MINHAYA_BG)
-        self._win.minsize(360, 280)
+        self._win.minsize(380, 300)
 
         self._win.protocol("WM_DELETE_WINDOW", self._on_close)
         self._win.bind("<Configure>", self._on_configure)
@@ -55,53 +54,59 @@ class AnswerWindow:
         # ボタン・ステータスを BOTTOM から先に pack（見切れ防止）
         # ============================================================
 
-        # --- ボタン行 ---
-        btn_frame = ctk.CTkFrame(win, fg_color="transparent")
-        btn_frame.pack(side="bottom", fill="x", padx=10, pady=(4, 10))
+        # --- ボタン行（2段） ---
 
-        self._start_btn = ctk.CTkButton(
-            btn_frame, text="開始",
-            font=FONT_BUTTON, width=90, height=34,
-            fg_color=MINHAYA_GREEN, hover_color="#388E3C",
-            text_color=MINHAYA_TEXT,
-            command=self._on_start_stop_click,
-        )
-        self._start_btn.pack(side="left", padx=(0, 4))
+        # 下段: リセット + 設定
+        btn_row2 = ctk.CTkFrame(win, fg_color="transparent")
+        btn_row2.pack(side="bottom", fill="x", padx=10, pady=(2, 10))
 
         self._reset_btn = ctk.CTkButton(
-            btn_frame, text="リセット",
-            font=FONT_BUTTON, width=90, height=34,
+            btn_row2, text="リセット",
+            font=FONT_BUTTON, width=80, height=30,
             fg_color=MINHAYA_ORANGE, hover_color="#F57C00",
             text_color=MINHAYA_TEXT,
             command=self._on_reset_click,
         )
-        self._reset_btn.pack(side="left", padx=(0, 4))
-
-        # テストキャプチャボタン（デバッグ用）
-        self._test_btn = ctk.CTkButton(
-            btn_frame, text="📷テスト",
-            font=FONT_BUTTON, width=90, height=34,
-            fg_color="#1565C0", hover_color="#0D47A1",
-            text_color=MINHAYA_TEXT,
-            command=self._on_test_capture_click,
-        )
-        self._test_btn.pack(side="left", padx=(0, 4))
+        self._reset_btn.pack(side="left", padx=(0, 6))
 
         self._settings_btn = ctk.CTkButton(
-            btn_frame, text="設定",
-            font=FONT_BUTTON, width=60, height=34,
+            btn_row2, text="設定",
+            font=FONT_BUTTON, width=60, height=30,
             fg_color=MINHAYA_BG_CARD, hover_color="#3A2F5E",
             text_color=MINHAYA_TEXT,
             command=self._on_settings_click,
         )
         self._settings_btn.pack(side="right")
 
+        # 上段: キャプチャ開始 + AI開始（メインボタン）
+        btn_row1 = ctk.CTkFrame(win, fg_color="transparent")
+        btn_row1.pack(side="bottom", fill="x", padx=10, pady=(4, 0))
+
+        self._capture_btn = ctk.CTkButton(
+            btn_row1, text="キャプチャ開始",
+            font=(FONT_FAMILY, 13, "bold"), width=140, height=40,
+            fg_color="#1565C0", hover_color="#0D47A1",
+            text_color=MINHAYA_TEXT,
+            command=self._on_capture_click,
+        )
+        self._capture_btn.pack(side="left", padx=(0, 6))
+
+        self._ai_btn = ctk.CTkButton(
+            btn_row1, text="AI開始",
+            font=(FONT_FAMILY, 15, "bold"), width=140, height=40,
+            fg_color=MINHAYA_GREEN, hover_color="#388E3C",
+            text_color=MINHAYA_TEXT,
+            command=self._on_ai_click,
+            state="disabled",
+        )
+        self._ai_btn.pack(side="left")
+
         # --- ステータス ---
         status_frame = ctk.CTkFrame(win, fg_color="transparent")
         status_frame.pack(side="bottom", fill="x", padx=12, pady=(2, 0))
 
         self._status_label = ctk.CTkLabel(
-            status_frame, text="停止中",
+            status_frame, text="キャプチャ枠を配置してください",
             font=FONT_STATUS, text_color=MINHAYA_TEXT_DIM,
         )
         self._status_label.pack(side="left")
@@ -159,17 +164,7 @@ class AnswerWindow:
         )
         self._reading_label.pack(padx=16, pady=(0, 12))
 
-        # engine_label は非表示だが互換性のため保持
-        self._engine_label = ctk.CTkLabel(a_frame, text="")
-        self._engine_label.pack_forget()
-        # question_label も非表示だが互換性のため保持
-        self._question_label = ctk.CTkLabel(a_frame, text="")
-        self._question_label.pack_forget()
-
     # --- public API ---
-
-    def set_question(self, text: str):
-        self._question_label.configure(text=text if text else "キャプチャを開始してください")
 
     def set_answer(self, text: str, reading: str = ""):
         self._answer_label.configure(text=text if text else "---")
@@ -195,14 +190,25 @@ class AnswerWindow:
     def set_timer(self, text: str):
         self._timer_label.configure(text=text)
 
-    def set_running(self, running: bool):
-        if running:
-            self._start_btn.configure(text="停止", fg_color=MINHAYA_RED, hover_color="#D32F2F")
+    def set_capture_active(self, active: bool):
+        if active:
+            self._capture_btn.configure(
+                text="キャプチャ停止", fg_color="#B71C1C", hover_color="#D32F2F")
+            # キャプチャ中ならAIボタンを有効化
+            self._ai_btn.configure(state="normal")
         else:
-            self._start_btn.configure(text="開始", fg_color=MINHAYA_GREEN, hover_color="#388E3C")
+            self._capture_btn.configure(
+                text="キャプチャ開始", fg_color="#1565C0", hover_color="#0D47A1")
+            # キャプチャ停止中はAIボタンを無効化
+            self._ai_btn.configure(state="disabled")
 
-    def set_engine_name(self, name: str):
-        self._engine_label.configure(text=name)
+    def set_api_active(self, active: bool):
+        if active:
+            self._ai_btn.configure(
+                text="AI停止", fg_color=MINHAYA_RED, hover_color="#D32F2F")
+        else:
+            self._ai_btn.configure(
+                text="AI開始", fg_color=MINHAYA_GREEN, hover_color="#388E3C")
 
     def set_close_callback(self, cb: Callable[[], None]):
         self._close_callback = cb
@@ -212,9 +218,13 @@ class AnswerWindow:
 
     # --- callbacks ---
 
-    def _on_start_stop_click(self):
-        if self._on_start_stop:
-            self._on_start_stop()
+    def _on_capture_click(self):
+        if self._on_capture_toggle:
+            self._on_capture_toggle()
+
+    def _on_ai_click(self):
+        if self._on_ai_toggle:
+            self._on_ai_toggle()
 
     def _on_reset_click(self):
         if self._on_reset:
@@ -223,10 +233,6 @@ class AnswerWindow:
     def _on_settings_click(self):
         if self._on_settings:
             self._on_settings()
-
-    def _on_test_capture_click(self):
-        if self._on_test_capture:
-            self._on_test_capture()
 
     def _on_close(self):
         if self._close_callback:
