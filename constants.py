@@ -8,8 +8,8 @@ LEGACY_CONFIG_FILE = os.path.expanduser("~/.minhaya_config.json")
 ENV_FILE = os.path.join(os.path.dirname(__file__), ".env")
 
 # --- タイミング ---
-CAPTURE_INTERVAL_MS = 300          # キャプチャ間隔 (ms)
-MIN_API_INTERVAL_SEC = 3.0         # API 最低呼び出し間隔 (秒)
+CAPTURE_INTERVAL_MS = 150          # キャプチャ間隔 (ms)
+MIN_API_INTERVAL_SEC = 0.5         # API 最低呼び出し間隔 (秒)
 IMAGE_DIFF_THRESHOLD = 0.95        # 画像一致率しきい値
 TEXT_SIMILARITY_THRESHOLD = 0.80   # テキスト類似度しきい値
 OCR_MIN_TEXT_LENGTH = 3            # OCR 最低文字数
@@ -17,8 +17,8 @@ OCR_MIN_TEXT_LENGTH = 3            # OCR 最低文字数
 # --- AI モデル ---
 CLAUDE_MODEL = "claude-sonnet-4-20250514"
 CLAUDE_MAX_TOKENS = 50
-GEMINI_MODEL = "gemini-2.0-flash"
-GEMINI_TIMEOUT = 10
+GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_TIMEOUT = 15
 
 # --- キャプチャウィンドウ デフォルト ---
 CAPTURE_DEFAULT_X = 100
@@ -34,7 +34,7 @@ RESIZE_HANDLE_SIZE = 12
 ANSWER_DEFAULT_X = 100
 ANSWER_DEFAULT_Y = 400
 ANSWER_DEFAULT_W = 520
-ANSWER_DEFAULT_H = 340
+ANSWER_DEFAULT_H = 440
 
 # --- カラー (hex) ---
 MINHAYA_PURPLE = "#6C3FB5"
@@ -67,6 +67,21 @@ CLAUDE_PROMPT_TEMPLATE = """早押しクイズです。問題文の途中かも�
 答え（単語のみ）:"""
 
 GEMINI_PROMPT = (
-    "これは早押しクイズの問題文の画像です。問題文を読み取り、答えだけを簡潔に回答してください。"
-    "漢字の場合は読み方をカッコで付けてください。例: 織田信長（おだのぶなが）\n答え:"
+    "早押しクイズ。画像の問題文から答えを推測せよ。\n"
+    "【絶対ルール】\n"
+    "・答えの単語だけを返せ。説明・描写・文章は一切禁止。\n"
+    "・分からなければ「不明」とだけ返せ。\n"
+    "・漢字には読みをカッコで付けろ。\n"
+    "{context}"
+    "形式（厳守・2行のみ）:\n"
+    "答え:単語（よみがな）\n"
+    "確信度:0-100"
 )
+
+# 前回の推測を含めるテンプレート
+GEMINI_CONTEXT_TEMPLATE = "前回の推測: {prev_answer}（確信度{prev_confidence}%）。問題文が更新された。推測を維持or修正せよ。\n"
+GEMINI_CONTEXT_EMPTY = ""
+
+# 画像最適化
+IMAGE_MAX_WIDTH = 640              # API送信前の最大幅 (px)
+IMAGE_JPEG_QUALITY = 70            # JPEG圧縮品質（速度優先）

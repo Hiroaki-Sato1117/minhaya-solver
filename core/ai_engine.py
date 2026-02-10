@@ -15,6 +15,8 @@ from PIL import Image
 from constants import (
     CLAUDE_MODEL, CLAUDE_MAX_TOKENS, CLAUDE_PROMPT_TEMPLATE,
     GEMINI_MODEL, GEMINI_TIMEOUT, GEMINI_PROMPT,
+    GEMINI_CONTEXT_TEMPLATE, GEMINI_CONTEXT_EMPTY,
+    IMAGE_MAX_WIDTH, IMAGE_JPEG_QUALITY,
 )
 
 # Gemini 用に SSL 検証を緩和
@@ -24,9 +26,10 @@ ssl._create_default_https_context = ssl._create_unverified_context
 # === 結果オブジェクト ===
 
 class AIResult:
-    __slots__ = ("answer", "error")
-    def __init__(self, answer: str = "", error: str = ""):
+    __slots__ = ("answer", "confidence", "error")
+    def __init__(self, answer: str = "", confidence: float = 0.0, error: str = ""):
         self.answer = answer
+        self.confidence = confidence  # 0.0 ~ 1.0
         self.error = error
 
 
@@ -60,19 +63,83 @@ class GeminiVisionEngine:
     def __init__(self, api_key: str):
         self._api_key = api_key
 
-    def ask_with_image(self, image: Image.Image) -> AIResult:
+    @staticmethod
+    def _optimize_image(image: Image.Image) -> tuple[bytes, str]:
+        """画像をリサイズ+JPEG圧縮して転送サイズを削減"""
+        img = image
+        # リサイズ（幅が大きすぎる場合）
+        if img.width > IMAGE_MAX_WIDTH:
+            ratio = IMAGE_MAX_WIDTH / img.width
+            new_h = int(img.height * ratio)
+            img = img.resize((IMAGE_MAX_WIDTH, new_h), Image.LANCZOS)
+
+        # JPEG 圧縮（PNG の 1/5〜1/10 のサイズ）
+        buf = io.BytesIO()
+        rgb = img.convert("RGB") if img.mode != "RGB" else img
+        rgb.save(buf, format="JPEG", quality=IMAGE_JPEG_QUALITY)
+        return buf.getvalue(), "image/jpeg"
+
+    @staticmethod
+    def _parse_response(text: str) -> tuple[str, float]:
+        """Gemini レスポンスから回答と確信度をパース"""
+        import re
+        confidence = 0.0
+
+        # 確信度を抽出
+        conf_match = re.search(r'確信度\s*[:：]\s*(\d+)', text)
+        if conf_match:
+            confidence = min(100, max(0, int(conf_match.group(1)))) / 100.0
+
+        # 答えを抽出
+        answer = "不明"
+        ans_match = re.search(r'答え\s*[:：]\s*(.+)', text)
+        if ans_match:
+            raw = ans_match.group(1).strip()
+            raw = re.split(r'\n|確信度', raw)[0].strip()
+            # 長すぎる回答（20文字超）は説明文と判断して不明にする
+            if len(raw) <= 30 and raw:
+                answer = raw
+            else:
+                answer = "不明"
+                confidence = 0.0
+        else:
+            # 形式に従っていない → 不明
+            answer = "不明"
+            confidence = 0.0
+
+        if answer == "不明":
+            confidence = 0.0
+
+        return answer, confidence
+
+    def ask_with_image(self, image: Image.Image,
+                       prev_answer: str = "", prev_confidence: int = 0) -> AIResult:
         try:
-            buf = io.BytesIO()
-            image.save(buf, format="PNG")
-            img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+            img_bytes, mime_type = self._optimize_image(image)
+            img_b64 = base64.b64encode(img_bytes).decode("utf-8")
+
+            # 前回の推測があればコンテキストに含める
+            if prev_answer and prev_confidence > 0:
+                context = GEMINI_CONTEXT_TEMPLATE.format(
+                    prev_answer=prev_answer, prev_confidence=prev_confidence)
+            else:
+                context = GEMINI_CONTEXT_EMPTY
+            prompt = GEMINI_PROMPT.format(context=context)
 
             payload = json.dumps({
                 "contents": [{
                     "parts": [
-                        {"text": GEMINI_PROMPT},
-                        {"inline_data": {"mime_type": "image/png", "data": img_b64}},
+                        {"text": prompt},
+                        {"inline_data": {"mime_type": mime_type, "data": img_b64}},
                     ]
-                }]
+                }],
+                "generationConfig": {
+                    "maxOutputTokens": 60,
+                    "temperature": 0.0,
+                    "thinkingConfig": {
+                        "thinkingBudget": 0,
+                    },
+                },
             }).encode()
 
             url = (
@@ -86,7 +153,9 @@ class GeminiVisionEngine:
             with urllib.request.urlopen(req, timeout=GEMINI_TIMEOUT) as res:
                 body = json.loads(res.read())
                 text = body["candidates"][0]["content"]["parts"][0]["text"].strip()
-                return AIResult(answer=text)
+                answer, confidence = self._parse_response(text)
+                print(f"[DEBUG] Gemini raw: {text!r}")
+                return AIResult(answer=answer, confidence=confidence)
 
         except urllib.error.HTTPError as e:
             error_body = e.read().decode("utf-8", errors="replace")
@@ -124,14 +193,15 @@ class AsyncAIRunner:
 
         threading.Thread(target=_run, daemon=True).start()
 
-    def submit_image(self, engine: GeminiVisionEngine, image: Image.Image):
-        """Gemini 用: 画像を非同期送信"""
+    def submit_image(self, engine: GeminiVisionEngine, image: Image.Image,
+                     prev_answer: str = "", prev_confidence: int = 0):
+        """Gemini 用: 画像を非同期送信（前回の推測コンテキスト付き）"""
         if self._busy:
             return
         self._busy = True
 
         def _run():
-            result = engine.ask_with_image(image)
+            result = engine.ask_with_image(image, prev_answer, prev_confidence)
             self._queue.put(result)
             self._busy = False
 

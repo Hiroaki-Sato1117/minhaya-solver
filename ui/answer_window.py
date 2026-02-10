@@ -8,30 +8,37 @@ from ui.styles import (
     MINHAYA_BG, MINHAYA_BG_CARD, MINHAYA_PURPLE, MINHAYA_PURPLE_DARK,
     MINHAYA_GOLD, MINHAYA_TEXT, MINHAYA_TEXT_DIM,
     MINHAYA_GREEN, MINHAYA_RED, MINHAYA_ORANGE,
+    FONT_FAMILY,
     FONT_QUESTION, FONT_ANSWER, FONT_ANSWER_READING,
     FONT_STATUS, FONT_LABEL, FONT_BUTTON, FONT_SMALL,
 )
 
 
 class AnswerWindow:
-    """みんはや風の回答ウィンドウ"""
+    """みんはや風の回答ウィンドウ
+
+    レイアウト戦略: ボタン・ステータスを先に pack(side="bottom") し、
+    ウィンドウが小さくても操作部分が見切れないようにする。
+    """
 
     def __init__(self, root: ctk.CTk, *,
                  x: int, y: int, w: int, h: int,
                  on_start_stop: Callable[[], None] | None = None,
                  on_reset: Callable[[], None] | None = None,
                  on_settings: Callable[[], None] | None = None,
+                 on_test_capture: Callable[[], None] | None = None,
                  on_geometry_change: Callable[[int, int, int, int], None] | None = None):
         self._on_start_stop = on_start_stop
         self._on_reset = on_reset
         self._on_settings = on_settings
+        self._on_test_capture = on_test_capture
         self._on_geometry_change = on_geometry_change
 
         self._win = ctk.CTkToplevel(root)
         self._win.title("みんはやソルバー v2.0")
         self._win.geometry(f"{w}x{h}+{x}+{y}")
         self._win.configure(fg_color=MINHAYA_BG)
-        self._win.minsize(400, 280)
+        self._win.minsize(360, 280)
 
         self._win.protocol("WM_DELETE_WINDOW", self._on_close)
         self._win.bind("<Configure>", self._on_configure)
@@ -44,75 +51,54 @@ class AnswerWindow:
     def _build_ui(self):
         win = self._win
 
-        # --- ヘッダー ---
-        header = ctk.CTkFrame(win, fg_color=MINHAYA_PURPLE, corner_radius=0, height=38)
-        header.pack(fill="x")
-        header.pack_propagate(False)
+        # ============================================================
+        # ボタン・ステータスを BOTTOM から先に pack（見切れ防止）
+        # ============================================================
 
-        ctk.CTkLabel(
-            header, text="みんはやソルバー",
-            font=(FONT_LABEL[0], 14, "bold"),
+        # --- ボタン行 ---
+        btn_frame = ctk.CTkFrame(win, fg_color="transparent")
+        btn_frame.pack(side="bottom", fill="x", padx=10, pady=(4, 10))
+
+        self._start_btn = ctk.CTkButton(
+            btn_frame, text="開始",
+            font=FONT_BUTTON, width=90, height=34,
+            fg_color=MINHAYA_GREEN, hover_color="#388E3C",
             text_color=MINHAYA_TEXT,
-        ).pack(side="left", padx=12)
-
-        self._engine_label = ctk.CTkLabel(
-            header, text="Gemini", font=FONT_SMALL, text_color=MINHAYA_GOLD,
+            command=self._on_start_stop_click,
         )
-        self._engine_label.pack(side="right", padx=12)
+        self._start_btn.pack(side="left", padx=(0, 4))
 
-        # --- 問題文エリア ---
-        q_frame = ctk.CTkFrame(win, fg_color=MINHAYA_BG_CARD, corner_radius=10)
-        q_frame.pack(fill="x", padx=10, pady=(10, 5))
-
-        ctk.CTkLabel(
-            q_frame, text="問題", font=FONT_SMALL,
-            text_color=MINHAYA_TEXT_DIM,
-        ).pack(anchor="w", padx=12, pady=(8, 0))
-
-        self._question_label = ctk.CTkLabel(
-            q_frame, text="キャプチャを開始してください",
-            font=FONT_QUESTION, text_color=MINHAYA_TEXT,
-            wraplength=460, justify="left",
+        self._reset_btn = ctk.CTkButton(
+            btn_frame, text="リセット",
+            font=FONT_BUTTON, width=90, height=34,
+            fg_color=MINHAYA_ORANGE, hover_color="#F57C00",
+            text_color=MINHAYA_TEXT,
+            command=self._on_reset_click,
         )
-        self._question_label.pack(anchor="w", padx=12, pady=(2, 10))
+        self._reset_btn.pack(side="left", padx=(0, 4))
 
-        # --- 回答エリア ---
-        a_frame = ctk.CTkFrame(win, fg_color=MINHAYA_PURPLE_DARK, corner_radius=10)
-        a_frame.pack(fill="x", padx=10, pady=5)
-
-        ctk.CTkLabel(
-            a_frame, text="回答", font=FONT_SMALL,
-            text_color=MINHAYA_GOLD,
-        ).pack(anchor="w", padx=12, pady=(8, 0))
-
-        self._answer_label = ctk.CTkLabel(
-            a_frame, text="---",
-            font=FONT_ANSWER, text_color=MINHAYA_GOLD,
-            wraplength=460, justify="left",
+        # テストキャプチャボタン（デバッグ用）
+        self._test_btn = ctk.CTkButton(
+            btn_frame, text="📷テスト",
+            font=FONT_BUTTON, width=90, height=34,
+            fg_color="#1565C0", hover_color="#0D47A1",
+            text_color=MINHAYA_TEXT,
+            command=self._on_test_capture_click,
         )
-        self._answer_label.pack(anchor="w", padx=12, pady=(0, 4))
+        self._test_btn.pack(side="left", padx=(0, 4))
 
-        self._reading_label = ctk.CTkLabel(
-            a_frame, text="",
-            font=FONT_ANSWER_READING, text_color=MINHAYA_TEXT_DIM,
+        self._settings_btn = ctk.CTkButton(
+            btn_frame, text="設定",
+            font=FONT_BUTTON, width=60, height=34,
+            fg_color=MINHAYA_BG_CARD, hover_color="#3A2F5E",
+            text_color=MINHAYA_TEXT,
+            command=self._on_settings_click,
         )
-        self._reading_label.pack(anchor="w", padx=12, pady=(0, 10))
-
-        # --- 信頼度バー ---
-        bar_frame = ctk.CTkFrame(win, fg_color="transparent")
-        bar_frame.pack(fill="x", padx=10, pady=(2, 0))
-
-        self._confidence_bar = ctk.CTkProgressBar(
-            bar_frame, height=6, corner_radius=3,
-            fg_color=MINHAYA_BG_CARD,
-            progress_color=MINHAYA_GREEN,
-        )
-        self._confidence_bar.pack(fill="x")
-        self._confidence_bar.set(0)
+        self._settings_btn.pack(side="right")
 
         # --- ステータス ---
         status_frame = ctk.CTkFrame(win, fg_color="transparent")
-        status_frame.pack(fill="x", padx=12, pady=(4, 0))
+        status_frame.pack(side="bottom", fill="x", padx=12, pady=(2, 0))
 
         self._status_label = ctk.CTkLabel(
             status_frame, text="停止中",
@@ -126,36 +112,59 @@ class AnswerWindow:
         )
         self._timer_label.pack(side="right")
 
-        # --- ボタン ---
-        btn_frame = ctk.CTkFrame(win, fg_color="transparent")
-        btn_frame.pack(fill="x", padx=10, pady=(8, 10))
+        # --- 信頼度パーセンテージ（大きく表示） ---
+        pct_frame = ctk.CTkFrame(win, fg_color="transparent")
+        pct_frame.pack(side="bottom", fill="x", padx=10, pady=(0, 2))
 
-        self._start_btn = ctk.CTkButton(
-            btn_frame, text="開始",
-            font=FONT_BUTTON, width=100, height=36,
-            fg_color=MINHAYA_GREEN, hover_color="#388E3C",
-            text_color=MINHAYA_TEXT,
-            command=self._on_start_stop_click,
-        )
-        self._start_btn.pack(side="left", padx=(0, 6))
+        ctk.CTkLabel(
+            pct_frame, text="確信度",
+            font=FONT_STATUS, text_color=MINHAYA_TEXT_DIM,
+        ).pack(side="left")
 
-        self._reset_btn = ctk.CTkButton(
-            btn_frame, text="リセット",
-            font=FONT_BUTTON, width=100, height=36,
-            fg_color=MINHAYA_ORANGE, hover_color="#F57C00",
-            text_color=MINHAYA_TEXT,
-            command=self._on_reset_click,
+        self._confidence_pct = ctk.CTkLabel(
+            pct_frame, text="0%",
+            font=(FONT_FAMILY, 28, "bold"), text_color=MINHAYA_TEXT_DIM,
         )
-        self._reset_btn.pack(side="left", padx=(0, 6))
+        self._confidence_pct.pack(side="right")
 
-        self._settings_btn = ctk.CTkButton(
-            btn_frame, text="設定",
-            font=FONT_BUTTON, width=70, height=36,
-            fg_color=MINHAYA_BG_CARD, hover_color="#3A2F5E",
-            text_color=MINHAYA_TEXT,
-            command=self._on_settings_click,
+        # --- 信頼度バー ---
+        bar_frame = ctk.CTkFrame(win, fg_color="transparent")
+        bar_frame.pack(side="bottom", fill="x", padx=10, pady=(2, 0))
+
+        self._confidence_bar = ctk.CTkProgressBar(
+            bar_frame, height=10, corner_radius=5,
+            fg_color=MINHAYA_BG_CARD,
+            progress_color=MINHAYA_GREEN,
         )
-        self._settings_btn.pack(side="right")
+        self._confidence_bar.pack(fill="x")
+        self._confidence_bar.set(0)
+
+        # ============================================================
+        # 回答エリア（メイン — 残り全スペースを使って大きく表示）
+        # ============================================================
+
+        a_frame = ctk.CTkFrame(win, fg_color=MINHAYA_PURPLE_DARK, corner_radius=10)
+        a_frame.pack(fill="both", expand=True, padx=10, pady=(6, 4))
+
+        self._answer_label = ctk.CTkLabel(
+            a_frame, text="---",
+            font=(FONT_FAMILY, 42, "bold"), text_color=MINHAYA_GOLD,
+            wraplength=460, justify="center",
+        )
+        self._answer_label.pack(expand=True, padx=16, pady=(12, 4))
+
+        self._reading_label = ctk.CTkLabel(
+            a_frame, text="",
+            font=(FONT_FAMILY, 18), text_color=MINHAYA_TEXT_DIM,
+        )
+        self._reading_label.pack(padx=16, pady=(0, 12))
+
+        # engine_label は非表示だが互換性のため保持
+        self._engine_label = ctk.CTkLabel(a_frame, text="")
+        self._engine_label.pack_forget()
+        # question_label も非表示だが互換性のため保持
+        self._question_label = ctk.CTkLabel(a_frame, text="")
+        self._question_label.pack_forget()
 
     # --- public API ---
 
@@ -170,6 +179,7 @@ class AnswerWindow:
         """0.0 ~ 1.0"""
         clamped = max(0.0, min(1.0, value))
         self._confidence_bar.set(clamped)
+        self._confidence_pct.configure(text=f"{clamped:.0%}")
         if clamped > 0.7:
             color = MINHAYA_GREEN
         elif clamped > 0.4:
@@ -177,6 +187,7 @@ class AnswerWindow:
         else:
             color = MINHAYA_RED
         self._confidence_bar.configure(progress_color=color)
+        self._confidence_pct.configure(text_color=color)
 
     def set_status(self, text: str, color: str = MINHAYA_TEXT_DIM):
         self._status_label.configure(text=text, text_color=color)
@@ -212,6 +223,10 @@ class AnswerWindow:
     def _on_settings_click(self):
         if self._on_settings:
             self._on_settings()
+
+    def _on_test_capture_click(self):
+        if self._on_test_capture:
+            self._on_test_capture()
 
     def _on_close(self):
         if self._close_callback:

@@ -2,10 +2,11 @@
 
 半透明ウィンドウ + 太い枠線。
 辺をドラッグでリサイズ、中央ドラッグで移動。
-キャプチャ時は一瞬非表示にして下の画面を撮影する。
+キャプチャ時は alpha=0.0 にして下の画面を撮影する。
 """
 
 from __future__ import annotations
+import time
 import tkinter as tk
 from typing import Callable
 
@@ -15,9 +16,11 @@ from constants import (
 )
 
 # 枠の太さ（つかみやすいように太め）
-_BORDER = 6
-# リサイズ判定のハンドル領域
-_HANDLE = 16
+_BORDER = 10
+# リサイズ判定のハンドル領域（辺のどこでも掴めるよう広めに）
+_HANDLE = 30
+# 通常時の透過度
+_NORMAL_ALPHA = 0.35
 
 
 class CaptureWindow:
@@ -25,8 +28,10 @@ class CaptureWindow:
 
     def __init__(self, root: tk.Tk, *,
                  x: int, y: int, w: int, h: int,
-                 on_geometry_change: Callable[[int, int, int, int], None] | None = None):
+                 on_geometry_change: Callable[[int, int, int, int], None] | None = None,
+                 on_focus_release: Callable[[], None] | None = None):
         self._on_geometry_change = on_geometry_change
+        self._on_focus_release = on_focus_release
         self._root = root
 
         self._win = tk.Toplevel(root)
@@ -34,8 +39,14 @@ class CaptureWindow:
         self._win.geometry(f"{w}x{h}+{x}+{y}")
         self._win.overrideredirect(True)
         self._win.attributes("-topmost", True)
-        # 半透明（枠は見える、中央は薄く透ける）
-        self._win.attributes("-alpha", 0.35)
+        self._win.attributes("-alpha", _NORMAL_ALPHA)
+
+        # macOS: overrideredirect ウィンドウのフォーカス固着を防止
+        try:
+            self._win.tk.call("::tk::unsupported::MacWindowStyle",
+                              "style", self._win._w, "plain", "none")
+        except Exception:
+            pass
 
         # Canvas
         self._canvas = tk.Canvas(
@@ -81,14 +92,15 @@ class CaptureWindow:
         self._draw()
 
     def hide(self):
-        """キャプチャ前に一瞬隠す"""
-        self._win.withdraw()
+        """キャプチャ前に完全透明にする（withdraw より高速・安定）"""
+        self._win.attributes("-alpha", 0.0)
         self._win.update_idletasks()
+        # macOS の WindowServer が反映するまで待機
+        time.sleep(0.05)
 
     def show(self):
         """キャプチャ後に復帰"""
-        self._win.deiconify()
-        self._win.attributes("-topmost", True)
+        self._win.attributes("-alpha", _NORMAL_ALPHA)
 
     def destroy(self):
         self._win.destroy()
@@ -112,40 +124,72 @@ class CaptureWindow:
         c.create_rectangle(0, b, b, h - b, fill=border_color, outline="")   # 左
         c.create_rectangle(w - b, b, w, h - b, fill=border_color, outline="")  # 右
 
-        # 四隅にハンドルマーク
+        # 四隅にハンドルマーク（L字型で掴みやすく表示）
         hs = _HANDLE
-        for cx, cy in [(0, 0), (w - hs, 0), (0, h - hs), (w - hs, h - hs)]:
-            c.create_rectangle(cx, cy, cx + hs, cy + hs,
-                               fill=border_color, outline="")
+        ht = b + 2  # ハンドルの太さ
+        for corner in ["nw", "ne", "sw", "se"]:
+            if corner == "nw":
+                c.create_rectangle(0, 0, hs, ht, fill=border_color, outline="")
+                c.create_rectangle(0, 0, ht, hs, fill=border_color, outline="")
+            elif corner == "ne":
+                c.create_rectangle(w - hs, 0, w, ht, fill=border_color, outline="")
+                c.create_rectangle(w - ht, 0, w, hs, fill=border_color, outline="")
+            elif corner == "sw":
+                c.create_rectangle(0, h - ht, hs, h, fill=border_color, outline="")
+                c.create_rectangle(0, h - hs, ht, h, fill=border_color, outline="")
+            elif corner == "se":
+                c.create_rectangle(w - hs, h - ht, w, h, fill=border_color, outline="")
+                c.create_rectangle(w - ht, h - hs, w, h, fill=border_color, outline="")
 
     # --- リサイズ端の判定 ---
 
     def _edge_at(self, ex: int, ey: int) -> str:
         w = self._canvas.winfo_width()
         h = self._canvas.winfo_height()
-        hs = _HANDLE
+        hs = _HANDLE  # 四隅のコーナー判定サイズ
+        b = _BORDER   # ボーダー幅（ボーダー上なら必ずリサイズ）
 
-        top = ey < hs
-        bottom = ey > h - hs
-        left = ex < hs
-        right = ex > w - hs
+        # コーナー判定（四隅は広めの領域で判定）
+        top_corner = ey < hs
+        bottom_corner = ey > h - hs
+        left_corner = ex < hs
+        right_corner = ex > w - hs
 
-        if top and left:
+        if top_corner and left_corner:
             return "nw"
-        if top and right:
+        if top_corner and right_corner:
             return "ne"
-        if bottom and left:
+        if bottom_corner and left_corner:
             return "sw"
-        if bottom and right:
+        if bottom_corner and right_corner:
             return "se"
-        if top:
+
+        # 辺の判定（ボーダー幅 or ハンドル領域内なら辺リサイズ）
+        on_top = ey < b
+        on_bottom = ey > h - b
+        on_left = ex < b
+        on_right = ex > w - b
+
+        if on_top:
             return "n"
-        if bottom:
+        if on_bottom:
             return "s"
-        if left:
+        if on_left:
             return "w"
-        if right:
+        if on_right:
             return "e"
+
+        # コーナー以外でもハンドル領域内なら辺リサイズ
+        if top_corner:
+            return "n"
+        if bottom_corner:
+            return "s"
+        if left_corner:
+            return "w"
+        if right_corner:
+            return "e"
+
+        # 中央 → 移動
         return ""
 
     _CURSOR_MAP = {
@@ -204,6 +248,9 @@ class CaptureWindow:
         self._drag_data = {}
         self._resize_edge = ""
         self._notify_change()
+        # フォーカスを回答ウィンドウへ戻す
+        if self._on_focus_release:
+            self._win.after(50, self._on_focus_release)
 
     def _notify_change(self):
         if self._on_geometry_change:

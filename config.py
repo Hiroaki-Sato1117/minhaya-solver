@@ -94,11 +94,18 @@ class ConfigStore:
             self._save()
 
     def _migrate(self, raw: dict) -> dict:
-        """旧フォーマット {"x","y","w","h"} → 新フォーマットへ変換"""
+        """旧フォーマット {"x","y","w","h"} → 新フォーマットへ変換
+        また、古い小さいデフォルト値を補正する。
+        """
         if "capture" in raw:
             # 既に v2 形式
             merged = dict(_DEFAULTS)
             merged.update(raw)
+            # 旧デフォルト高さ (340) で保存されていたら補正
+            aw = merged.get("answer_window", {})
+            if aw.get("h", 0) < 400:
+                aw["h"] = ANSWER_DEFAULT_H
+                merged["answer_window"] = aw
             return merged
 
         # 旧フォーマット: トップレベルに x/y/w/h がある
